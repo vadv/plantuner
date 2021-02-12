@@ -44,6 +44,8 @@
 #if PG_VERSION_NUM >= 100000
 #include <utils/regproc.h>
 #include <utils/varlena.h>
+#define SearchSysCache1(cacheId, key1) \
+	SearchSysCache(cacheId, key1, 0, 0, 0)
 #endif
 #if PG_VERSION_NUM >= 120000
 #include <access/table.h>
