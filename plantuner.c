@@ -6,13 +6,13 @@
  * modification, are permitted provided that the following conditions
  * are met:
  * 1. Redistributions of source code must retain the above copyright
- *        notice, this list of conditions and the following disclaimer.
+ *		notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
- *        notice, this list of conditions and the following disclaimer in the
- *        documentation and/or other materials provided with the distribution.
+ *		notice, this list of conditions and the following disclaimer in the
+ *		documentation and/or other materials provided with the distribution.
  * 3. Neither the name of the author nor the names of any co-contributors
- *        may be used to endorse or promote products derived from this software
- *        without specific prior written permission.
+ *		may be used to endorse or promote products derived from this software
+ *		without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY CONTRIBUTORS ``AS IS'' AND ANY EXPRESS
  * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
@@ -29,53 +29,64 @@
 
 #include <postgres.h>
 
+#include <fmgr.h>
+#include <miscadmin.h>
 #include <access/heapam.h>
-#include <access/htup_details.h>
+#include <access/xact.h>
 #include <catalog/namespace.h>
+#include <catalog/pg_class.h>
 #include <nodes/pg_list.h>
 #include <optimizer/plancat.h>
 #include <storage/bufmgr.h>
 #include <utils/builtins.h>
 #include <utils/guc.h>
 #include <utils/lsyscache.h>
-#include <utils/memutils.h>
 #include <utils/rel.h>
-#include <utils/syscache.h>
 #if PG_VERSION_NUM >= 100000
 #include <utils/regproc.h>
 #include <utils/varlena.h>
-#define SearchSysCache1(cacheId, key1) \
-	SearchSysCache(cacheId, key1, 0, 0, 0)
-#endif
-#if PG_VERSION_NUM >= 120000
-#include <access/table.h>
-#define heap_open(r, l)					table_open(r, l)
-#define heap_close(r, l)				table_close(r, l)
 #endif
 
 PG_MODULE_MAGIC;
 
-void _PG_init(void);
+#if PG_VERSION_NUM >= 130000
+#define heap_open(r, l)					table_open(r, l)
+#define heap_close(r, l)				table_close(r, l)
+#endif
 
-static int		nDisabledIndexes		= 0;
-static Oid	   *disabledIndexes			= NULL;
-static char	   *disableIndexesOutStr	= "";
+static int	nDisabledIndexes = 0;
+static Oid	*disabledIndexes = NULL;
+static char *disableIndexesOutStr = "";
 
-static int		nEnabledIndexes			= 0;
-static Oid	   *enabledIndexes			= NULL;
-static char	   *enableIndexesOutStr		= "";
+static int	nEnabledIndexes = 0;
+static Oid	*enabledIndexes = NULL;
+static char *enableIndexesOutStr = "";
 
-get_relation_info_hook_type prevHook	= NULL;
-static bool fix_empty_table				= false;
+static int	nOnlyIndexes = 0;
+static Oid	*onlyIndexes = NULL;
+static char *onlyIndexesOutStr = "";
 
+get_relation_info_hook_type	prevHook = NULL;
+static bool	fix_empty_table = false;
+
+static bool	plantuner_enable_inited = false;
+static bool	plantuner_only_inited = false;
+static bool	plantuner_disable_inited = false;
+
+typedef enum IndexListKind {
+	EnabledKind,
+	DisabledKind,
+	OnlyKind
+} IndexListKind;
 
 static const char *
-indexesAssign(const char *newval, bool doit, bool isDisable)
+indexesAssign(const char * newval, bool doit, GucSource source,
+			  IndexListKind kind)
 {
-	char	   *rawname;
-	List	   *namelist;
-	ListCell   *l;
-	Oid		   *newOids = NULL;
+	char		*rawname;
+	List		*namelist;
+	ListCell	*l;
+	Oid			*newOids = NULL;
 	int			nOids = 0,
 				i = 0;
 
@@ -84,53 +95,116 @@ indexesAssign(const char *newval, bool doit, bool isDisable)
 	if (!SplitIdentifierString(rawname, ',', &namelist))
 		goto cleanup;
 
+	/*
+	 * follow work could be done only in normal processing because of
+	 * accsess to system catalog
+	 */
+	if (MyBackendId == InvalidBackendId || !IsUnderPostmaster ||
+		!IsTransactionState())
+	{
+		/* reset init state */
+		switch(kind)
+		{
+			case EnabledKind:
+				plantuner_enable_inited = false;
+				break;
+			case DisabledKind:
+				plantuner_disable_inited = false;
+				break;
+			case OnlyKind:
+				plantuner_only_inited = false;
+				break;
+			default:
+				elog(ERROR, "wrong kind");
+		}
+
+		return newval;
+	}
+
 	if (doit)
 	{
-		MemoryContext	oldcxt;
-
 		nOids = list_length(namelist);
-		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-		newOids = palloc0(sizeof(Oid) * nOids);
-		MemoryContextSwitchTo(oldcxt);
+		newOids = malloc(sizeof(Oid) * (nOids+1));
+		if (!newOids)
+			elog(ERROR,"could not allocate %d bytes",
+				 (int)(sizeof(Oid) * (nOids+1)));
+	}
 
-		if (isDisable)
-		{
-			nDisabledIndexes = nOids;
-			if (disabledIndexes != NULL)
-				pfree(disabledIndexes);
-
-			disabledIndexes = newOids;
-		}
-		else
-		{
-			nEnabledIndexes = nOids;
-			if (enabledIndexes != NULL)
-				pfree(enabledIndexes);
-
-			enabledIndexes = newOids;
-		}
+	switch(kind)
+	{
+		case EnabledKind:
+			plantuner_enable_inited = true;
+			break;
+		case DisabledKind:
+			plantuner_disable_inited = true;
+			break;
+		case OnlyKind:
+			plantuner_only_inited = true;
+			break;
+		default:
+			elog(ERROR, "wrong kind");
 	}
 
 	foreach(l, namelist)
 	{
-		char	   *curname = (char *) lfirst(l);
-		Oid			indexOid = RangeVarGetRelid(makeRangeVarFromNameList(stringToQualifiedNameList(curname)),
-												NoLock, true);
+		char	*curname = (char *) lfirst(l);
+#if PG_VERSION_NUM >= 90200
+		Oid		indexOid = RangeVarGetRelid(
+				makeRangeVarFromNameList(stringToQualifiedNameList(curname)),
+											NoLock, true);
+#else
+		Oid		indexOid = RangeVarGetRelid(
+				makeRangeVarFromNameList(stringToQualifiedNameList(curname)),
+											true);
+#endif
 
 		if (indexOid == InvalidOid)
 		{
+#if PG_VERSION_NUM >= 90100
 			if (doit == false)
-				elog(WARNING, "'%s' does not exist", curname);
+#endif
+				elog(WARNING,"'%s' does not exist", curname);
 			continue;
 		}
-		else if (get_rel_relkind(indexOid) != RELKIND_INDEX)
+		else if ( get_rel_relkind(indexOid) != RELKIND_INDEX )
 		{
+#if PG_VERSION_NUM >= 90100
 			if (doit == false)
-				elog(WARNING, "'%s' is not an index", curname);
+#endif
+				elog(WARNING,"'%s' is not an index", curname);
 			continue;
 		}
 		else if (doit)
+		{
 			newOids[i++] = indexOid;
+		}
+	}
+
+	if (doit)
+	{
+		switch(kind)
+		{
+			case EnabledKind:
+				nEnabledIndexes = i;
+				if (enabledIndexes)
+					free(enabledIndexes);
+				enabledIndexes = newOids;
+				break;
+			case DisabledKind:
+				nDisabledIndexes = i;
+				if (disabledIndexes)
+					free(disabledIndexes);
+				disabledIndexes = newOids;
+				break;
+			case OnlyKind:
+				nOnlyIndexes = i;
+				if (onlyIndexes)
+					free(onlyIndexes);
+				onlyIndexes = newOids;
+				break;
+			default:
+				elog(ERROR, "wrong kind");
+		}
 	}
 
 	pfree(rawname);
@@ -141,18 +215,64 @@ indexesAssign(const char *newval, bool doit, bool isDisable)
 cleanup:
 	if (newOids)
 		free(newOids);
-
 	pfree(rawname);
 	list_free(namelist);
 	return NULL;
 }
 
+static const char *
+assignDisabledIndexes(const char * newval, bool doit, GucSource source)
+{
+	return indexesAssign(newval, doit, source, DisabledKind);
+}
+
+static const char *
+assignEnabledIndexes(const char * newval, bool doit, GucSource source)
+{
+	return indexesAssign(newval, doit, source, EnabledKind);
+}
+
+static const char *
+assignOnlyIndexes(const char * newval, bool doit, GucSource source)
+{
+	return indexesAssign(newval, doit, source, OnlyKind);
+}
+
+static void
+lateInit()
+{
+	if (!plantuner_only_inited)
+		indexesAssign(onlyIndexesOutStr, true, PGC_S_USER, OnlyKind);
+	if (!plantuner_enable_inited)
+		indexesAssign(enableIndexesOutStr, true, PGC_S_USER, EnabledKind);
+	if (!plantuner_disable_inited)
+		indexesAssign(disableIndexesOutStr, true, PGC_S_USER, DisabledKind);
+}
+
+#if PG_VERSION_NUM >= 90100
+
+static bool
+checkOnlyIndexes(char **newval, void **extra, GucSource source)
+{
+	char *val;
+
+	val = (char*)indexesAssign(*newval, false, source, OnlyKind);
+
+	if (val)
+	{
+		*newval = val;
+		return true;
+	}
+
+	return false;
+}
+
 static bool
 checkDisabledIndexes(char **newval, void **extra, GucSource source)
 {
-	char	   *val;
+	char *val;
 
-	val = (char *) indexesAssign(*newval, false, true);
+	val = (char*)indexesAssign(*newval, false, source, DisabledKind);
 
 	if (val)
 	{
@@ -166,9 +286,9 @@ checkDisabledIndexes(char **newval, void **extra, GucSource source)
 static bool
 checkEnabledIndexes(char **newval, void **extra, GucSource source)
 {
-	char	   *val;
+	char *val;
 
-	val = (char *) indexesAssign(*newval, false, false);
+	val = (char*)indexesAssign(*newval, false, source, EnabledKind);
 
 	if (val)
 	{
@@ -180,40 +300,70 @@ checkEnabledIndexes(char **newval, void **extra, GucSource source)
 }
 
 static void
-assignDisabledIndexes(const char *newval, void *extra)
+assignDisabledIndexesNew(const char *newval, void *extra)
 {
-	indexesAssign(newval, true, true);
+	assignDisabledIndexes(newval, true, PGC_S_USER /* doesn't matter */);
 }
 
 static void
-assignEnabledIndexes(const char *newval, void *extra)
+assignEnabledIndexesNew(const char *newval, void *extra)
 {
-	indexesAssign(newval, true, false);
+	assignEnabledIndexes(newval, true, PGC_S_USER /* doesn't matter */);
 }
 
 static void
-indexFilter(PlannerInfo *root, Oid relationObjectId, bool inhparent, RelOptInfo *rel)
+assignOnlyIndexesNew(const char *newval, void *extra)
 {
-	int			i;
+	assignOnlyIndexes(newval, true, PGC_S_USER /* doesn't matter */);
+}
 
-	for (i = 0; i < nDisabledIndexes; i++)
+#endif
+
+static void
+indexFilter(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+			RelOptInfo *rel)
+{
+	int i;
+
+	lateInit();
+
+	if (nOnlyIndexes > 0)
+	{
+		ListCell	*l;
+
+restart1:
+		foreach(l, rel->indexlist)
+		{
+			IndexOptInfo	*info = (IndexOptInfo*)lfirst(l);
+			bool			remove = true;
+
+			for(i=0; remove && i<nOnlyIndexes; i++)
+				if (onlyIndexes[i] == info->indexoid)
+					remove = false;
+
+			if (remove)
+			{
+				rel->indexlist = list_delete_ptr(rel->indexlist, info);
+				goto restart1;
+			}
+		}
+
+		return;
+	}
+
+	for(i=0; i<nDisabledIndexes; i++)
 	{
 		ListCell   *l;
-		Oid			disabledOid;
-
-		disabledOid = disabledIndexes[i];
-		if (disabledOid == InvalidOid)
-			continue;
 
 		foreach(l, rel->indexlist)
 		{
-			IndexOptInfo *info = (IndexOptInfo *) lfirst(l);
+			IndexOptInfo	*info = (IndexOptInfo*)lfirst(l);
 
-			if (disabledOid == info->indexoid)
+			if (disabledIndexes[i] == info->indexoid)
 			{
-				int			j;
+				int j;
 
-				for (j = 0; j < nEnabledIndexes; j++)
+				for(j=0; j<nEnabledIndexes; j++)
 					if (enabledIndexes[j] == info->indexoid)
 						break;
 
@@ -227,7 +377,8 @@ indexFilter(PlannerInfo *root, Oid relationObjectId, bool inhparent, RelOptInfo 
 }
 
 static void
-execPlantuner(PlannerInfo *root, Oid relationObjectId, bool inhparent, RelOptInfo *rel)
+execPlantuner(PlannerInfo *root, Oid relationObjectId, bool inhparent,
+			  RelOptInfo *rel)
 {
 	Relation	relation;
 
@@ -240,7 +391,7 @@ execPlantuner(PlannerInfo *root, Oid relationObjectId, bool inhparent, RelOptInf
 			 * estimate_rel_size() could be too pessimistic for particular
 			 * workload
 			 */
-			rel->pages = 0.0;
+			rel->pages = 1.0;
 			rel->tuples = 0.0;
 		}
 
@@ -255,77 +406,75 @@ execPlantuner(PlannerInfo *root, Oid relationObjectId, bool inhparent, RelOptInf
 		prevHook(root, relationObjectId, inhparent, rel);
 }
 
-/*
- * generate_qualified_relation_name
- *		Compute the name to display for a relation specified by OID
- *
- * As above, but unconditionally schema-qualify the name.
- */
-static char *
-generate_qualified_relation_name(Oid relid)
+static const char*
+IndexFilterShow(Oid* indexes, int nIndexes)
 {
-	HeapTuple	tp;
-	Form_pg_class reltup;
-	char	   *relname;
-	char	   *nspname;
-	char	   *result = NULL;
+	char	*val, *ptr;
+	int		i,
+			len;
 
-	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-	if (!HeapTupleIsValid(tp))
-		return NULL;
+	lateInit();
 
-	reltup = (Form_pg_class) GETSTRUCT(tp);
-	relname = NameStr(reltup->relname);
+	len = 1 /* \0 */ + nIndexes * (2 * NAMEDATALEN + 2 /* ', ' */ + 1 /* . */);
+	ptr = val = palloc(len);
 
-	nspname = get_namespace_name(reltup->relnamespace);
-	if (nspname)
-		result = quote_qualified_identifier(nspname, relname);
-
-	ReleaseSysCache(tp);
-
-	return result;
-}
-
-static const char *
-IndexFilterShow(Oid *indexes, int nIndexes)
-{
-	int i;
-	StringInfoData buf;
-
-	initStringInfo(&buf);
-
-	for (i = 0; i < nIndexes && indexes[i] != InvalidOid; i++)
+	*ptr =(char)'\0';
+	for(i=0; i<nIndexes; i++)
 	{
-		char *s = generate_qualified_relation_name(indexes[i]);
+		char	*relname = get_rel_name(indexes[i]);
+		Oid		nspOid = get_rel_namespace(indexes[i]);
+		char	*nspname = get_namespace_name(nspOid);
 
-		if (s == NULL)
+		if ( relname == NULL || nspOid == InvalidOid || nspname == NULL )
 			continue;
 
-		if (i != 0)
-			appendStringInfoString(&buf, ", ");
-
-		appendStringInfoString(&buf, s);
-		pfree(s);
+		ptr += snprintf(ptr, len - (ptr - val), "%s%s.%s",
+												(i==0) ? "" : ", ",
+												nspname,
+												relname);
 	}
 
-	return buf.data;
+	return val;
 }
 
-static const char *
+static const char*
 disabledIndexFilterShow(void)
 {
 	return IndexFilterShow(disabledIndexes, nDisabledIndexes);
 }
 
-static const char *
+static const char*
 enabledIndexFilterShow(void)
 {
 	return IndexFilterShow(enabledIndexes, nEnabledIndexes);
 }
 
+static const char*
+onlyIndexFilterShow(void)
+{
+	return IndexFilterShow(onlyIndexes, nOnlyIndexes);
+}
+
+void _PG_init(void);
 void
 _PG_init(void)
 {
+	DefineCustomStringVariable(
+		"plantuner.forbid_index",
+		"List of forbidden indexes (deprecated)",
+		"Listed indexes will not be used in queries (deprecated, use plantuner.disable_index)",
+		&disableIndexesOutStr,
+		"",
+		PGC_USERSET,
+		0,
+#if PG_VERSION_NUM >= 90100
+		checkDisabledIndexes,
+		assignDisabledIndexesNew,
+#else
+		assignDisabledIndexes,
+#endif
+		disabledIndexFilterShow
+	);
 
 	DefineCustomStringVariable(
 		"plantuner.disable_index",
@@ -335,8 +484,12 @@ _PG_init(void)
 		"",
 		PGC_USERSET,
 		0,
+#if PG_VERSION_NUM >= 90100
 		checkDisabledIndexes,
+		assignDisabledIndexesNew,
+#else
 		assignDisabledIndexes,
+#endif
 		disabledIndexFilterShow
 	);
 
@@ -348,9 +501,30 @@ _PG_init(void)
 		"",
 		PGC_USERSET,
 		0,
+#if PG_VERSION_NUM >= 90100
 		checkEnabledIndexes,
+		assignEnabledIndexesNew,
+#else
 		assignEnabledIndexes,
+#endif
 		enabledIndexFilterShow
+	);
+
+	DefineCustomStringVariable(
+		"plantuner.only_index",
+		"List of explicitly enabled indexes (overload plantuner.disable_index and plantuner.enable_index)",
+		"Only indexes in this list are allowed",
+		&onlyIndexesOutStr,
+		"",
+		PGC_USERSET,
+		0,
+#if PG_VERSION_NUM >= 90100
+		checkOnlyIndexes,
+		assignOnlyIndexesNew,
+#else
+		assignOnlyIndexes,
+#endif
+		onlyIndexFilterShow
 	);
 
 	DefineCustomBoolVariable(
@@ -358,15 +532,21 @@ _PG_init(void)
 		"Sets to zero estimations for empty tables",
 		"Sets to zero estimations for empty or newly created tables",
 		&fix_empty_table,
+#if PG_VERSION_NUM >= 80400
 		fix_empty_table,
+#endif
 		PGC_USERSET,
+#if PG_VERSION_NUM >= 80400
 		GUC_NOT_IN_SAMPLE,
+#if PG_VERSION_NUM >= 90100
 		NULL,
+#endif
+#endif
 		NULL,
 		NULL
 	);
 
-	if (get_relation_info_hook != execPlantuner)
+	if (get_relation_info_hook != execPlantuner )
 	{
 		prevHook = get_relation_info_hook;
 		get_relation_info_hook = execPlantuner;
