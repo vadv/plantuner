@@ -20,8 +20,8 @@ echo 'local all all trust' > "/etc/postgresql/$VER/main/pg_hba.conf"
 /etc/init.d/postgresql start
 export PG_CONFIG="/usr/lib/postgresql/$VER/bin/pg_config"
 make clean && make && make install
-psql -Atc 'alter system set shared_preload_libraries to plantuner'
+psql -Atc 'alter system set session_preload_libraries to plantuner'
 /etc/init.d/postgresql restart
-psql -Atc "alter system set plantuner.disable_index to 'miss_index'"
+psql -Atc "alter user postgres set plantuner.disable_index to 'miss_index'"
 /etc/init.d/postgresql restart
 make installcheck
