@@ -460,23 +460,6 @@ void
 _PG_init(void)
 {
 	DefineCustomStringVariable(
-		"plantuner.forbid_index",
-		"List of forbidden indexes (deprecated)",
-		"Listed indexes will not be used in queries (deprecated, use plantuner.disable_index)",
-		&disableIndexesOutStr,
-		"",
-		PGC_USERSET,
-		0,
-#if PG_VERSION_NUM >= 90100
-		checkDisabledIndexes,
-		assignDisabledIndexesNew,
-#else
-		assignDisabledIndexes,
-#endif
-		disabledIndexFilterShow
-	);
-
-	DefineCustomStringVariable(
 		"plantuner.disable_index",
 		"List of disabled indexes",
 		"Listed indexes will not be used in queries",
