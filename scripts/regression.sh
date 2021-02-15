@@ -22,4 +22,6 @@ export PG_CONFIG="/usr/lib/postgresql/$VER/bin/pg_config"
 make clean && make && make install
 psql -Atc 'alter system set shared_preload_libraries to plantuner'
 /etc/init.d/postgresql restart
+psql -Atc "alter system set plantunner.disable_index to 'miss_index'"
+/etc/init.d/postgresql restart
 make installcheck
